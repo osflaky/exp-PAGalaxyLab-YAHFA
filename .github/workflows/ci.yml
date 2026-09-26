@@ -1,0 +1,98 @@
+name: Android CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest--arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v1
+      # windows-11-arm images ship without an Android SDK (no ANDROID_SDK_ROOT),
+      # so provision one there. sdkmanager needs Java 17+; Temurin 17 has no
+      # Windows aarch64 build, so use Temurin 21. The build JDK is set afterwards.
+    - uses: actions/setup-java@v4
+      if: matrix.runner == 'windows-11-arm'
+      with:
+        distribution: temurin
+        java-version: 21
+    - uses: android-actions/setup-android@v3
+      if: matrix.runner == 'windows-11-arm'
+      with:
+        packages: >-
+          platform-tools
+          platforms;android-28
+          build-tools;29.0.2
+      # sdkmanager hides the x86_64-only NDK and CMake packages from an aarch64
+      # Windows host, so fetch the versions AGP 4.1.1 expects directly
+      # (NDK r21b = 21.1.6352462, CMake 3.10.2.4988404). The x64 binaries run
+      # under Windows 11 ARM emulation.
+    - name: install NDK 21.1.6352462 and CMake 3.10.2.4988404
+      if: matrix.runner == 'windows-11-arm'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        $sdk = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+
+        $zip = Join-Path $env:RUNNER_TEMP 'ndk.zip'
+        $tmp = Join-Path $env:RUNNER_TEMP 'ndk-extract'
+        Invoke-WebRequest -Uri 'https://dl.google.com/android/repository/android-ndk-r21b-windows-x86_64.zip' -OutFile $zip
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        tar -xf $zip -C $tmp
+        if ($LASTEXITCODE -ne 0) { throw "failed to extract NDK" }
+        New-Item -ItemType Directory -Force -Path (Join-Path $sdk 'ndk') | Out-Null
+        Move-Item -Path (Join-Path $tmp 'android-ndk-r21b') -Destination (Join-Path $sdk 'ndk\21.1.6352462')
+        Get-Content (Join-Path $sdk 'ndk\21.1.6352462\source.properties')
+
+        $czip = Join-Path $env:RUNNER_TEMP 'cmake.zip'
+        $ctmp = Join-Path $env:RUNNER_TEMP 'cmake-extract'
+        Invoke-WebRequest -Uri 'https://dl.google.com/android/repository/cmake-3.10.2-windows-x86_64.zip' -OutFile $czip
+        New-Item -ItemType Directory -Force -Path $ctmp | Out-Null
+        tar -xf $czip -C $ctmp
+        if ($LASTEXITCODE -ne 0) { throw "failed to extract CMake" }
+        $croot = $ctmp
+        if (-not (Test-Path (Join-Path $croot 'bin\cmake.exe'))) {
+          $sub = Get-ChildItem -Path $ctmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin\cmake.exe') } | Select-Object -First 1
+          if (-not $sub) { throw "cmake.exe not found in CMake archive" }
+          $croot = $sub.FullName
+        }
+        $cdest = Join-Path $sdk 'cmake\3.10.2.4988404'
+        New-Item -ItemType Directory -Force -Path (Join-Path $sdk 'cmake') | Out-Null
+        Move-Item -Path $croot -Destination $cdest
+        & (Join-Path $cdest 'bin\cmake.exe') --version
+        if ($LASTEXITCODE -ne 0) { throw "cmake does not run" }
+
+        # Point AGP at the SDK and the manually installed CMake explicitly.
+        $sdkProp = $sdk -replace '\\', '/'
+        $cmakeProp = $cdest -replace '\\', '/'
+        Set-Content -Path local.properties -Encoding ascii -Value @("sdk.dir=$sdkProp", "cmake.dir=$cmakeProp")
+        Get-Content local.properties
+    - uses: actions/setup-java@v1
+      if: matrix.runner != 'macos-15-intel'
+      with:
+        java-version: 1.8
+      # setup-java@v1 unpacks the macOS JDK 8 bundle without its Contents/Home
+      # layout, so JAVA_HOME points to a directory that is not a valid JDK
+      # ("JAVA_HOME is set to an invalid directory"). setup-java@v4 handles
+      # the macOS bundle layout and sets JAVA_HOME to .../Contents/Home.
+    - uses: actions/setup-java@v4
+      if: matrix.runner == 'macos-15-intel'
+      with:
+        distribution: zulu
+        java-version: 8
+        architecture: x64
+    - name: build
+      run: ./gradlew :library:build --stacktrace
+
+
+    name: build [${{ matrix.expander_leg }}]
+    timeout-minutes: 150
